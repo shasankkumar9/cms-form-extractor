@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: cms-form-extractor
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
+server:
+  port: 8080
+
+ollama:
+  base-url: http://localhost:11434
+  model: qwen2.5-vl-instruct
+  timeout-seconds: 120
+
+form:
+  extraction:
+    max-retries: 3
+    confidence-threshold: 0.7

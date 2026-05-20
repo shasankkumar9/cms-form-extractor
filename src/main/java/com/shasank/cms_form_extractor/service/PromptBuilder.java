@@ -188,4 +188,249 @@ public class PromptBuilder {
             Return complete structured JSON response with all extracted fields and metadata.
             """;
     }
+
+    /**
+     * Build a HyDE seed prompt to create a best-guess draft before focused extraction passes.
+     */
+    public String buildHyDEDraftPrompt() {
+        return """
+            Create a hypothetical best-guess CMS extraction draft from this form image.
+
+            Rules:
+            - Prioritize likely field structure even when values are partially unreadable.
+            - Use null for unknown values; do not hallucinate exact identifiers.
+            - Include confidenceScore (0-1) for the overall draft and line-level fields.
+
+            Return JSON only using this schema:
+            {
+              "formType": "CMS-1500|UB-04|UNKNOWN",
+              "isValid": true,
+              "confidenceScore": 0.0,
+              "patient": {},
+              "provider": {},
+              "physician": {},
+              "diagnoses": [],
+              "serviceLines": [],
+              "serviceStartDate": null,
+              "serviceEndDate": null,
+              "claimNumber": null,
+              "providerControlNumber": null
+            }
+            """;
+    }
+
+    /**
+     * Build HyDE draft from textual evidence when image calls are intentionally minimized.
+     */
+    public String buildHyDEFromEvidencePrompt(String metadataJson, String evidenceJson) {
+        return String.format("""
+            Create a best-guess CMS extraction draft from textual evidence.
+
+            Metadata hints:
+            %s
+
+            Evidence JSON from image pass:
+            %s
+
+            Rules:
+            - Use evidence first, metadata as secondary hints.
+            - Keep unknown fields null.
+            - Provide realistic confidenceScore.
+
+            Return JSON only in the standard extraction schema.
+            """, metadataJson, evidenceJson);
+    }
+
+    /**
+     * Build a focused extraction prompt for one section to keep each model call small.
+     */
+    public String buildFocusedExtractionPrompt(String section, String hydeDraftJson, String currentExtractionJson) {
+        return String.format("""
+            You are extracting ONLY the "%s" section from a CMS claim form image.
+
+            HyDE draft (hypothetical starting point):
+            %s
+
+            Current extracted JSON (from previous passes):
+            %s
+
+            Requirements:
+            - Focus only on section "%s" and related fields.
+            - Preserve existing values when not improving confidence.
+            - If a value is uncertain, keep null and explain via lower confidence.
+            - Return JSON only with the standard extraction schema.
+            - Keep unchanged sections from current extracted JSON intact.
+            """, section, hydeDraftJson, currentExtractionJson, section);
+    }
+
+    /**
+     * Build a final synthesis prompt to reconcile all focused-pass outputs into one response.
+     */
+    public String buildSynthesisPrompt(String hydeDraftJson, String mergedExtractionJson) {
+        return String.format("""
+            Reconcile the final CMS extraction using these two inputs:
+
+            HyDE draft:
+            %s
+
+            Merged focused extraction:
+            %s
+
+            Produce one clean final JSON with:
+            - Best-supported values
+            - Confidence scores reflecting ambiguity
+            - Null for unknown or unreadable values
+
+            Return JSON only using the standard extraction schema.
+            """, hydeDraftJson, mergedExtractionJson);
+    }
+
+    /**
+     * Build one multimodal evidence prompt so follow-up refinement can run as text-only calls.
+     */
+    public String buildImageEvidencePrompt(String metadataJson) {
+        return String.format("""
+            Read this CMS claim form image and return concise evidence JSON.
+
+            Filename-derived metadata hints (may be partial):
+            %s
+
+            Instructions:
+            - Extract visible text snippets and key-value candidates.
+            - Include likely form type and any obvious field anchors.
+            - Do not fabricate values; use null when uncertain.
+
+            Return JSON only:
+            {
+              "likelyFormType": "CMS-1500|UB-04|UNKNOWN",
+              "observations": ["..."],
+              "candidateFields": {
+                "memberIdNumber": null,
+                "providerNPI": null,
+                "claimNumber": null,
+                "serviceDate": null
+              }
+            }
+            """, metadataJson);
+    }
+
+    /**
+     * Build text-only refinement prompt for one section using evidence and HyDE draft.
+     */
+    public String buildSectionRefinementPrompt(
+        String section,
+        String metadataJson,
+        String evidenceJson,
+        String hydeDraftJson,
+        String currentExtractionJson
+    ) {
+        return String.format("""
+            Refine ONLY the section "%s" for CMS extraction.
+
+            Metadata hints from filename:
+            %s
+
+            Evidence from image pass:
+            %s
+
+            HyDE draft JSON:
+            %s
+
+            Current extraction JSON:
+            %s
+
+            Requirements:
+            - Update only fields relevant to section "%s".
+            - Keep high-confidence existing values unchanged.
+            - Use null for unknown values; no hallucination.
+            - Return full extraction JSON schema so it can be merged directly.
+
+            Return JSON only.
+            """, section, metadataJson, evidenceJson, hydeDraftJson, currentExtractionJson, section);
+    }
+
+    /**
+     * Agent-style focused question prompt for a specific field or group.
+     */
+    public String buildFieldQuestionPrompt(String fieldName, String fieldDescription, String preFilled, String context) {
+        return String.format("""
+            Focus on extracting: %s
+            Description: %s
+
+            Pre-filled from filename/metadata: %s
+
+            Context/Previously Extracted:
+            %s
+
+            Rules:
+            1. Return null if field is not visible or unreadable
+            2. Provide confidenceScore (0-1) for extracted value
+            3. If value is partially visible, include alternatives
+            4. Keep response JSON focused on this field only
+
+            Return JSON:
+            {
+              "%s": {
+                "value": null,
+                "confidenceScore": 0.0,
+                "alternatives": [],
+                "reasoning": ""
+              }
+            }
+            """, fieldName, fieldDescription, preFilled != null ? preFilled : "none",
+                context != null ? context : "{}", fieldName);
+    }
+
+    /**
+     * HyDE agent verification prompt: confirm extracted value makes sense.
+     */
+    public String buildHyDEAgentVerificationPrompt(String fieldName, String extractedValue, String context) {
+        return String.format("""
+            Verify extracted value for field "%s": "%s"
+
+            Context (related fields):
+            %s
+
+            Checks:
+            1. Is this a valid value for "%s"?
+            2. Does it match format/pattern expected?
+            3. Does it make clinical/business sense given context?
+            4. Are there likely alternative readings?
+
+            Return JSON:
+            {
+              "isValid": true/false,
+              "confidence": 0.0-1.0,
+              "alternatives": ["alt1", "alt2"],
+              "reasoning": "brief explanation",
+              "recommendedValue": "best guess or null"
+            }
+            """, fieldName, extractedValue, context, fieldName);
+    }
+
+    /**
+     * Agent loop iteration prompt: refine based on previous questions.
+     */
+    public String buildAgentIterationPrompt(String previousExtraction, String failedFields, String clarifications) {
+        return String.format("""
+            Refine CMS extraction based on previous attempt.
+
+            Previously Extracted:
+            %s
+
+            Fields with LOW confidence (< 0.7):
+            %s
+
+            Additional clarifications/hints:
+            %s
+
+            Task:
+            - Re-examine failed fields carefully
+            - Use context from related fields to improve confidence
+            - Provide alternatives if still uncertain
+            - Flag fields needing manual review
+
+            Return complete refined extraction JSON with improved confidence scores.
+            """, previousExtraction, failedFields, clarifications);
+    }
 }

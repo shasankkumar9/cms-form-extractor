@@ -137,12 +137,11 @@ public class FormExtractionService {
     }
 
     /**
-     * Extract data with agentic loop for refinement
+     * OPTIMIZED extraction for smaller models: faster, focused field extraction
      */
     private FormExtractionResponse extractDataWithAgenticLoop(BufferedImage image, Map<String, String> fileMetadata) throws IOException {
         String base64Image = fileProcessingUtil.imageToBase64(image);
         FormExtractionResponse response = new FormExtractionResponse();
-        int maxIterations = properties.getMaxRetries() != null ? properties.getMaxRetries() : 2;
         String metadataJson = gson.toJson(fileMetadata == null ? Map.of() : fileMetadata);
 
         // Pre-populate known fields from filename metadata
@@ -150,70 +149,185 @@ public class FormExtractionService {
             populateFromMetadata(response, fileMetadata);
         }
 
-        // Make a single multimodal pass, then switch to text-only refinement to reduce model crashes/timeouts.
-        String evidenceJson = "{}";
+        // OPTIMIZED: Single fast pass with focused field extraction
+        logger.info("Starting optimized extraction with focused field prompts");
+
         try {
-            String evidencePrompt = promptBuilder.buildImageEvidencePrompt(metadataJson);
-            evidenceJson = ollamaClient.generateResponse(base64Image, evidencePrompt);
+            // Fast patient extraction
+            String patientPrompt = promptBuilder.buildFastPatientExtractionPrompt();
+            String patientResponse = ollamaClient.generateResponse(base64Image, patientPrompt);
+            FormExtractionResponse patientData = parsingService.parseExtractionResponse(patientResponse);
+            mergeExtractionResponses(response, patientData);
+            logger.info("Patient extraction confidence: {}", response.getConfidenceScore());
         } catch (IOException e) {
-            if (isVisionTensorFailure(e)) {
-                logger.warn("Vision model tensor assertion occurred; continuing with metadata + text-only refinement", e);
-            } else {
-                logger.warn("Image evidence extraction failed; continuing with metadata + text-only refinement", e);
-            }
+            logger.warn("Patient extraction failed", e);
         }
 
-        String hydePrompt = promptBuilder.buildHyDEFromEvidencePrompt(metadataJson, evidenceJson);
-        String hydeDraftJson = "{}";
+        // Fast provider extraction
         try {
-            hydeDraftJson = ollamaClient.generateTextResponse(hydePrompt);
-            FormExtractionResponse hydeDraft = parsingService.parseExtractionResponse(hydeDraftJson);
-            mergeExtractionResponses(response, hydeDraft);
+            String providerPrompt = promptBuilder.buildFastProviderExtractionPrompt();
+            String providerResponse = ollamaClient.generateResponse(base64Image, providerPrompt);
+            FormExtractionResponse providerData = parsingService.parseExtractionResponse(providerResponse);
+            mergeExtractionResponses(response, providerData);
+            logger.info("Provider extraction confidence: {}", response.getConfidenceScore());
         } catch (IOException e) {
-            logger.warn("Failed to build HyDE draft from textual evidence", e);
+            logger.warn("Provider extraction failed", e);
         }
 
-        List<String> sections = List.of(
-            "Patient and Insurance",
-            "Provider and Physician",
-            "Diagnosis Codes",
-            "Service Lines and Financials"
-        );
+        // Fast physician extraction
+        try {
+            String physicianPrompt = promptBuilder.buildFastPhysicianExtractionPrompt();
+            String physicianResponse = ollamaClient.generateResponse(base64Image, physicianPrompt);
+            FormExtractionResponse physicianData = parsingService.parseExtractionResponse(physicianResponse);
+            mergeExtractionResponses(response, physicianData);
+            logger.info("Physician extraction confidence: {}", response.getConfidenceScore());
+        } catch (IOException e) {
+            logger.warn("Physician extraction failed", e);
+        }
 
-        for (int iteration = 1; iteration <= maxIterations; iteration++) {
-            logger.info("Agent extraction iteration {}/{}", iteration, maxIterations);
-            boolean improved = false;
+        // Fast diagnosis extraction
+        try {
+            String diagnosisPrompt = promptBuilder.buildFastDiagnosisExtractionPrompt();
+            String diagnosisResponse = ollamaClient.generateResponse(base64Image, diagnosisPrompt);
+            FormExtractionResponse diagnosisData = parsingService.parseExtractionResponse(diagnosisResponse);
+            mergeExtractionResponses(response, diagnosisData);
+            logger.info("Diagnosis extraction confidence: {}", response.getConfidenceScore());
+        } catch (IOException e) {
+            logger.warn("Diagnosis extraction failed", e);
+        }
 
-            for (String section : sections) {
-                try {
-                    String prompt = promptBuilder.buildSectionRefinementPrompt(
-                        section,
-                        metadataJson,
-                        evidenceJson,
-                        hydeDraftJson,
-                        gson.toJson(response)
-                    );
-                    String ollamaResponse = ollamaClient.generateTextResponse(prompt);
-                    FormExtractionResponse fieldResponse = parsingService.parseExtractionResponse(ollamaResponse);
-                    double previous = response.getConfidenceScore();
+        // Fast service line extraction
+        try {
+            String serviceLinePrompt = promptBuilder.buildFastServiceLineExtractionPrompt();
+            String serviceLineResponse = ollamaClient.generateResponse(base64Image, serviceLinePrompt);
+            FormExtractionResponse serviceLineData = parsingService.parseExtractionResponse(serviceLineResponse);
+            mergeExtractionResponses(response, serviceLineData);
+            logger.info("Service line extraction confidence: {}", response.getConfidenceScore());
+        } catch (IOException e) {
+            logger.warn("Service line extraction failed", e);
+        }
 
-                    mergeExtractionResponses(response, fieldResponse);
-                    if (response.getConfidenceScore() > previous) {
-                        improved = true;
-                    }
-                } catch (IOException e) {
-                    logger.warn("Failed to extract section [{}] at iteration {}", section, iteration, e);
-                }
-            }
+        // OPTIMIZED: Refine only low-confidence fields
+        double threshold = properties.getConfidenceThreshold() != null ? properties.getConfidenceThreshold() : 0.7;
+        int maxRetries = properties.getMaxRetries() != null ? properties.getMaxRetries() : 1;
 
-            if (response.getConfidenceScore() >= 0.85 || !improved) {
-                logger.info("Agent extraction completed at iteration {} with confidence score: {}",
-                    iteration, response.getConfidenceScore());
+        for (int iteration = 1; iteration <= maxRetries && response.getConfidenceScore() < 0.85; iteration++) {
+            logger.info("Fast refinement iteration {}/{}", iteration, maxRetries);
+            boolean refinedAny = refineLowConfidenceFields(base64Image, response, threshold);
+
+            if (!refinedAny) {
+                logger.info("No low-confidence fields to refine, stopping");
                 break;
             }
         }
 
         return response;
+    }
+
+    /**
+     * OPTIMIZED: Refine only fields with confidence below threshold
+     */
+    private boolean refineLowConfidenceFields(String base64Image, FormExtractionResponse response, double threshold) {
+        boolean refined = false;
+
+        // Check and refine provider NPI
+        if (response.getProviderDetails() != null &&
+            response.getProviderDetails().getProviderNPI() != null) {
+            try {
+                String prompt = promptBuilder.buildFastFieldVerificationPrompt(
+                    "Provider NPI",
+                    response.getProviderDetails().getProviderNPI()
+                );
+                String verResponse = ollamaClient.generateResponse(base64Image, prompt);
+                Map<String, Object> result = parseFieldVerificationResponse(verResponse);
+                if ((boolean) result.getOrDefault("isValid", true)) {
+                    Double confidence = (Double) result.getOrDefault("confidence", 0.5);
+                    if (confidence > threshold) {
+                        response.getProviderDetails().setProviderNPI(
+                            (String) result.getOrDefault("suggestedValue", response.getProviderDetails().getProviderNPI())
+                        );
+                        refined = true;
+                    }
+                }
+            } catch (IOException e) {
+                logger.debug("Failed to verify provider NPI", e);
+            }
+        }
+
+        // Check and refine diagnosis codes
+        if (response.getDiagnosisCodes() != null) {
+            for (DiagnosisCode code : response.getDiagnosisCodes()) {
+                if (code.getConfidenceScore() < threshold && code.getCode() != null) {
+                    try {
+                        String prompt = promptBuilder.buildFastFieldVerificationPrompt(
+                            "ICD-10 Code",
+                            code.getCode()
+                        );
+                        String verResponse = ollamaClient.generateResponse(base64Image, prompt);
+                        Map<String, Object> result = parseFieldVerificationResponse(verResponse);
+                        if ((boolean) result.getOrDefault("isValid", true)) {
+                            Double confidence = (Double) result.getOrDefault("confidence", 0.5);
+                            code.setConfidenceScore(confidence);
+                            String suggested = (String) result.getOrDefault("suggestedValue", null);
+                            if (suggested != null) {
+                                code.setCode(suggested);
+                                refined = true;
+                            }
+                        }
+                    } catch (IOException e) {
+                        logger.debug("Failed to verify diagnosis code: {}", code.getCode(), e);
+                    }
+                }
+            }
+        }
+
+        // Check and refine service lines
+        if (response.getServiceLines() != null) {
+            for (ServiceLine line : response.getServiceLines()) {
+                if (line.getConfidenceScore() < threshold && line.getCptCode() != null) {
+                    try {
+                        String prompt = promptBuilder.buildFastFieldVerificationPrompt(
+                            "CPT Code",
+                            line.getCptCode()
+                        );
+                        String verResponse = ollamaClient.generateResponse(base64Image, prompt);
+                        Map<String, Object> result = parseFieldVerificationResponse(verResponse);
+                        if ((boolean) result.getOrDefault("isValid", true)) {
+                            Double confidence = (Double) result.getOrDefault("confidence", 0.5);
+                            line.setConfidenceScore(confidence);
+                            String suggested = (String) result.getOrDefault("suggestedValue", null);
+                            if (suggested != null) {
+                                line.setCptCode(suggested);
+                                refined = true;
+                            }
+                        }
+                    } catch (IOException e) {
+                        logger.debug("Failed to verify CPT code: {}", line.getCptCode(), e);
+                    }
+                }
+            }
+        }
+
+        return refined;
+    }
+
+    /**
+     * Parse field verification response
+     */
+    private Map<String, Object> parseFieldVerificationResponse(String response) {
+        Map<String, Object> result = new HashMap<>();
+        try {
+            int jsonStart = response.indexOf("{");
+            int jsonEnd = response.lastIndexOf("}");
+            if (jsonStart != -1 && jsonEnd != -1) {
+                String jsonStr = response.substring(jsonStart, jsonEnd + 1);
+                Map<String, Object> parsed = gson.fromJson(jsonStr, Map.class);
+                result.putAll(parsed);
+            }
+        } catch (Exception e) {
+            logger.debug("Error parsing field verification response", e);
+        }
+        return result;
     }
 
     private boolean isVisionTensorFailure(IOException exception) {
@@ -393,92 +507,20 @@ public class FormExtractionService {
     }
 
     /**
-     * Enhance extraction using HyDE (Hypothetical Document Embeddings) approach
+     * OPTIMIZED: Enhance extraction only if confidence is low
      */
     private FormExtractionResponse enhanceExtractionWithHyDE(FormExtractionResponse response, BufferedImage image) throws IOException {
-        logger.info("Applying HyDE enhancement due to low confidence score: {}", response.getConfidenceScore());
+        logger.info("Applying fast field verification due to low confidence: {}", response.getConfidenceScore());
 
         String base64Image = fileProcessingUtil.imageToBase64(image);
-        List<ExtractionNote> notes = new ArrayList<>();
+        double threshold = properties.getConfidenceThreshold() != null ? properties.getConfidenceThreshold() : 0.7;
 
-        // Verify diagnosis codes
-        if (response.getDiagnosisCodes() != null && !response.getDiagnosisCodes().isEmpty()) {
-            double threshold = properties.getConfidenceThreshold() != null ? properties.getConfidenceThreshold() : 0.7;
-            for (DiagnosisCode code : response.getDiagnosisCodes()) {
-                if (code.getConfidenceScore() < threshold) {
-                    ExtractionNote note = verifyFieldWithHyDE(base64Image, "Diagnosis Code", code.getCode());
-                    notes.add(note);
-                }
-            }
-        }
+        // Use fast field verification instead of expensive HyDE verification
+        refineLowConfidenceFields(base64Image, response, threshold);
 
-        // Verify service lines
-        if (response.getServiceLines() != null && !response.getServiceLines().isEmpty()) {
-            double threshold = properties.getConfidenceThreshold() != null ? properties.getConfidenceThreshold() : 0.7;
-            for (ServiceLine line : response.getServiceLines()) {
-                if (line.getConfidenceScore() < threshold) {
-                    StringBuilder fieldDesc = new StringBuilder();
-                    fieldDesc.append("Service Line ").append(line.getLineNumber());
-                    if (line.getCptCode() != null) {
-                        fieldDesc.append(" CPT: ").append(line.getCptCode());
-                    }
-
-                    ExtractionNote note = verifyFieldWithHyDE(base64Image, fieldDesc.toString(),
-                                                             gson.toJson(line));
-                    notes.add(note);
-                }
-            }
-        }
-
-        response.setNotes(notes);
         return response;
     }
 
-    /**
-     * Verify a specific field using HyDE approach
-     */
-    private ExtractionNote verifyFieldWithHyDE(String base64Image, String fieldName, String extractedValue) throws IOException {
-        String prompt = promptBuilder.buildHyDEVerificationPrompt(fieldName, extractedValue);
-
-        String response = ollamaClient.generateResponse(base64Image, prompt);
-        Map<String, Object> verification = parseVerificationResponse(response);
-
-        ExtractionNote note = new ExtractionNote();
-        note.setFieldName(fieldName);
-        note.setOriginalValue(extractedValue);
-        note.setConfidenceScore((double) verification.getOrDefault("confidence", 0.5));
-        note.setResolution((String) verification.getOrDefault("reasoning", "Manual review recommended"));
-        note.setIssue(((boolean) verification.getOrDefault("isValid", true)) ? "VERIFIED" : "AMBIGUOUS");
-
-        List<?> alternatives = (List<?>) verification.get("alternatives");
-        if (alternatives != null && !alternatives.isEmpty()) {
-            note.setSuggestedValue(String.valueOf(alternatives.get(0)));
-        }
-
-        return note;
-    }
-
-    /**
-     * Parse HyDE verification response
-     */
-    private Map<String, Object> parseVerificationResponse(String response) {
-        Map<String, Object> result = new HashMap<>();
-
-        try {
-            int jsonStart = response.indexOf("{");
-            int jsonEnd = response.lastIndexOf("}");
-
-            if (jsonStart != -1 && jsonEnd != -1) {
-                String jsonStr = response.substring(jsonStart, jsonEnd + 1);
-                Map<String, Object> parsed = gson.fromJson(jsonStr, Map.class);
-                result.putAll(parsed);
-            }
-        } catch (Exception e) {
-            logger.error("Error parsing verification response", e);
-        }
-
-        return result;
-    }
 
     /**
      * Validate extracted data against CMS form standards and cross-check fields

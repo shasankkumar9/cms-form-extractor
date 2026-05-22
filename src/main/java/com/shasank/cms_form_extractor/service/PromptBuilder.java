@@ -7,94 +7,39 @@ public class PromptBuilder {
 
     /**
      * Build the main extraction prompt with form knowledge and rules
+     * OPTIMIZED for smaller models: Shorter prompts, fewer requirements
      */
     public String buildFormValidationPrompt() {
         return """
-            You are a professional CMS standard form extraction system. Your task is to analyze the provided medical claim form image and determine:
+            Analyze this medical claim form image. Is it a valid CMS-1500 or UB-04 form?
             
-            1. Whether this is a valid HCFA CMS-1500 form or UB-04 CMS-1450 form
-            2. The form type if valid
-            3. Overall form quality assessment
+            CMS-1500: Red/pink form, 33 fields, for physician services
+            UB-04: Blue form, for hospital services
             
-            FORM CHARACTERISTICS:
-            - CMS-1500 (HCFA): Used by healthcare providers for physician services, office visits, procedures
-              * Red/pink colored form with 33 fields arranged in specific positions
-              * Includes patient, provider, diagnosis, and service line information
-              * Specific field positions are standardized
-            
-            - UB-04 (CMS-1450): Used by hospitals/facilities for institutional services
-              * Blue colored form with structured layout
-              * Contains multiple pages
-              * Different field arrangements than CMS-1500
-            
-            QUALITY ASSESSMENT FACTORS:
-            - Image clarity and resolution
-            - Form skewness (analyze if form appears rotated or skewed)
-            - Overlapping text or field borders
-            - Legibility of printed and handwritten content
-            - Presence of barcode/form identifiers
-            
-            Respond with a JSON object containing:
+            Return JSON:
             {
               "isValid": true/false,
-              "formType": "CMS-1500" or "UB-04" or "UNKNOWN",
-              "qualityScore": 0-100,
-              "qualityIssues": [],
-              "recommendation": "PROCEED" or "MANUAL_REVIEW"
+              "formType": "CMS-1500|UB-04|UNKNOWN",
+              "qualityScore": 0-100
             }
             """;
     }
 
     /**
      * Build the data extraction prompt
+     * OPTIMIZED for smaller models: Simplified extraction requests
      */
     public String buildDataExtractionPrompt() {
         return """
-            You are a CMS form data extraction specialist. Extract all relevant data from the medical claim form with the following rules:
+            Extract patient, provider, physician, diagnosis codes, and service lines from this CMS form.
             
-            PATIENT INFORMATION:
-            - Extract patient name, DOB, gender, address, phone
-            - Insurance company and member ID (usually located in upper right area)
-            - Group number if present
+            PATIENT: name, DOB, gender, insurance ID
+            PROVIDER: name, NPI (10 digits), address
+            PHYSICIAN: name, NPI
+            DIAGNOSIS: ICD-10 codes (format: X.XX)
+            SERVICE LINES: date, CPT code (5 chars), charges
             
-            PROVIDER INFORMATION:
-            - Provider name (upper left area, usually box 33)
-            - Provider NPI (box 24j or equivalent)
-            - Tax ID/EIN if visible
-            - Provider address and phone
-            
-            PHYSICIAN INFORMATION:
-            - Attending/treating physician name
-            - Physician NPI
-            - License number if visible
-            
-            DIAGNOSIS CODES:
-            - ICD-10 codes are typically in specific fields (boxes A-L on CMS-1500)
-            - Format: XXX.XX or XXXXX structure
-            - May be handwritten or printed
-            - Links to service lines via pointer numbers (1-4)
-            
-            SERVICE LINES:
-            - Date of service (separate start and end dates if applicable)
-            - Place of service code (11=office, 21=inpatient, etc.)
-            - CPT/HCPCS procedure codes
-            - Modifiers (up to 4 modifiers allowed)
-            - Diagnosis pointers (link to diagnosis codes)
-            - Charges, quantities, and payment information
-            - CPT codes are 5-digit alphanumeric (e.g., 99213, 70553)
-            
-            FORM-SPECIFIC RULES:
-            - Fields have fixed positions on the standardized form
-            - Read field positions carefully even if overlapping
-            - Dates are typically MM/DD/YYYY format
-            - Handles skewed/rotated forms using form coordinate understanding
-            
-            AMBIGUITY HANDLING:
-            - If a value is unclear, provide alternatives with confidence scores
-            - Note overlapping or bleeding text specifically
-            - Flag fields that appear handwritten vs printed
-            
-            Respond with comprehensive JSON containing all extracted data with confidence scores (0-1).
+            Return JSON with confidence scores 0-1.
             """;
     }
 
@@ -152,40 +97,13 @@ public class PromptBuilder {
 
     /**
      * Build the comprehensive analysis prompt for the entire form
+     * OPTIMIZED: Removed stages, focus on key data only
      */
     public String buildComprehensiveAnalysisPrompt() {
         return """
-            Perform comprehensive CMS form analysis with the following workflow:
+            Extract from CMS form: patient info, provider (NPI), physician, diagnosis codes (ICD-10), service lines (date, CPT, charges).
             
-            STAGE 1: FORM IDENTIFICATION & VALIDATION
-            - Identify form type (CMS-1500 or UB-04)
-            - Assess image quality and any capture issues
-            
-            STAGE 2: HIERARCHICAL EXTRACTION
-            - Priority 1: Patient demographics and insurance info (top-left area)
-            - Priority 2: Provider and physician information (right side)
-            - Priority 3: Diagnosis codes (specific field areas)
-            - Priority 4: Service lines with complete details
-            - Priority 5: Financial information (charges, payments)
-            
-            STAGE 3: DATA VALIDATION & CROSS-CHECKING
-            - Verify code formats (NPI=10 digits, ICD-10 with period, CPT=5 chars)
-            - Ensure service line diagnosis pointers match extracted diagnoses
-            - Check date consistency (service dates, DOB, etc.)
-            
-            STAGE 4: CONFIDENCE SCORING
-            - Assign confidence scores based on:
-              * Text clarity (handwritten vs printed)
-              * Field position verification
-              * Format compliance
-              * Cross-field consistency
-            
-            STAGE 5: ISSUE FLAGGING
-            - Mark ambiguous values
-            - Flag low-confidence extractions
-            - Note form quality issues affecting specific fields
-            
-            Return complete structured JSON response with all extracted fields and metadata.
+            Return JSON with all fields and confidence scores (0-1). Mark uncertain fields with lower confidence, use null for unknown.
             """;
     }
 
@@ -433,4 +351,120 @@ public class PromptBuilder {
             Return complete refined extraction JSON with improved confidence scores.
             """, previousExtraction, failedFields, clarifications);
     }
+
+    // ===== NEW OPTIMIZED PROMPTS FOR SMALL MODELS (qwen2.5vl:3b) =====
+
+    /**
+     * Extract ONLY patient demographics - minimal context
+     */
+    public String buildFastPatientExtractionPrompt() {
+        return """
+            Extract ONLY patient data:
+            - First name, last name, DOB (MM/DD/YYYY), gender
+            - Address, phone, email (if visible)
+            - Insurance ID, group number
+            
+            Return JSON for patient section only. Use null for missing fields.
+            Confidence scores 0-1.
+            """;
+    }
+
+    /**
+     * Extract ONLY provider information - minimal context
+     */
+    public String buildFastProviderExtractionPrompt() {
+        return """
+            Extract ONLY provider data:
+            - Provider name
+            - NPI (10 digits)
+            - Tax ID/EIN
+            - Address, phone, fax
+            
+            Return JSON for provider section only. Use null for missing fields.
+            Confidence scores 0-1.
+            """;
+    }
+
+    /**
+     * Extract ONLY physician information
+     */
+    public String buildFastPhysicianExtractionPrompt() {
+        return """
+            Extract ONLY physician data:
+            - First name, last name
+            - NPI (10 digits)
+            - License number, specialization
+            
+            Return JSON for physician section only. Use null for missing fields.
+            Confidence scores 0-1.
+            """;
+    }
+
+    /**
+     * Extract ONLY diagnosis codes
+     */
+    public String buildFastDiagnosisExtractionPrompt() {
+        return """
+            Extract ONLY diagnosis codes:
+            - ICD-10 format (e.g., E11.22, M54.5)
+            - Code type, description
+            - Pointer numbers (1-4 if applicable)
+            
+            Return JSON for diagnoses list only. Use null for missing fields.
+            Confidence scores 0-1.
+            """;
+    }
+
+    /**
+     * Extract ONLY service lines - one at a time for clarity
+     */
+    public String buildFastServiceLineExtractionPrompt() {
+        return """
+            Extract ONLY service line data:
+            - Line number, date of service (MM/DD/YYYY)
+            - Place of service code
+            - CPT/HCPCS code (5 characters)
+            - Modifiers (if any)
+            - Diagnosis pointers
+            - Units, charges
+            
+            Return JSON for serviceLines list only. Use null for missing fields.
+            Confidence scores 0-1.
+            """;
+    }
+
+    /**
+     * Verify single field with minimal context
+     */
+    public String buildFastFieldVerificationPrompt(String fieldName, String extractedValue) {
+        return String.format("""
+            Is "%s" a valid value for %s?
+            
+            Return JSON:
+            {
+              "isValid": true/false,
+              "confidence": 0.0-1.0,
+              "suggestedValue": "correct value or null"
+            }
+            """, extractedValue, fieldName);
+    }
+
+    /**
+     * Quick refinement for low-confidence fields
+     */
+    public String buildFastRefinementPrompt(String fieldName, String currentValue, String confidence) {
+        return String.format("""
+            Recheck %s (current: "%s", confidence: %s).
+            Is there a better reading?
+            
+            Return JSON:
+            {
+              "value": "best reading or null",
+              "confidence": 0.0-1.0,
+              "reasoning": "brief note"
+            }
+            """, fieldName, currentValue, confidence);
+    }
 }
+
+

@@ -11,7 +11,7 @@ server:
 
 ollama:
   base-url: http://localhost:11434
-  model: qwen2.5vl:7b
+  model: qwen2.5vl:3b
   timeout-seconds: 0
 
 form:
